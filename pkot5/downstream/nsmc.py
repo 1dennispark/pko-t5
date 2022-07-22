@@ -1,10 +1,42 @@
+import functools
 import os
 from statistics import mean
 
 import fire
 import numpy as np
+import torch
 from datasets import load_dataset
-from transformers import T5TokenizerFast, T5ForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments, DataCollatorForSeq2Seq, TrainingArguments, Trainer, EvalPrediction
+from tqdm.auto import tqdm
+from transformers import T5TokenizerFast, T5ForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments, DataCollatorForSeq2Seq, TrainingArguments, Trainer, EvalPrediction, \
+    TrainerCallback, AutoTokenizer
+
+
+class TrainerCallbackForEval(TrainerCallback):
+    @torch.no_grad()
+    def on_evaluate(self, args, state, control, **kwargs):
+        model: T5ForConditionalGeneration = kwargs['model']
+        tokenizer = kwargs['tokenizer']
+        eval_dataloader = kwargs['eval_dataloader']
+        metrics = kwargs['metrics']
+
+        all_logits, all_labels = [], []
+        for data in tqdm(eval_dataloader, desc="evaluating.."):
+            data = data.convert_to_tensors('pt').to(device='cuda')
+            logits = model.generate(input_ids=data['input_ids'],
+                                    attention_mask=data['attention_mask'],
+                                    max_length=5)
+            all_logits += logits.tolist()
+            all_labels += data['labels'].tolist()
+
+        predictions = all_logits
+        label_ids = all_labels
+
+        predictions = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+        acc = float(mean(1. if pred == label else 0. for pred, label in zip(predictions, labels)))
+        metrics.update({'eval_accuracy': acc})
+        tqdm.write(f"{metrics}")
 
 
 def train(model_name):
@@ -14,7 +46,7 @@ def train(model_name):
 
     print(f"ex) {train_data[0]}")
 
-    tokenizer = T5TokenizerFast.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     dataset = []
     for data in [train_data, test_data]:
         all_input_ids = tokenizer([row['document'] for row in data], add_special_tokens=True, max_length=512, truncation=True).input_ids
@@ -27,6 +59,7 @@ def train(model_name):
         dataset.append(data)
     train_data, test_data = dataset
 
+    # torch.distributed.init_process_group(backend="gloo")
     args = Seq2SeqTrainingArguments(
         "pko-t5-nsmc",
         overwrite_output_dir=True,
@@ -37,37 +70,26 @@ def train(model_name):
         local_rank=int(os.getenv("LOCAL_RANK", "-1")),
 
         per_device_train_batch_size=64,
-        per_device_eval_batch_size=8,
+        per_device_eval_batch_size=32,
+        gradient_accumulation_steps=1,
 
         evaluation_strategy='epoch',
         save_strategy='no',
-
-        predict_with_generate=True,
-        generation_max_length=5,
     )
 
-    model = T5ForConditionalGeneration.from_pretrained(model_name)
-
-    def _compute_metrics(eval_prediction: EvalPrediction):
-        predictions = eval_prediction.predictions
-        label_ids = eval_prediction.label_ids
-
-        predictions = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        label_ids[label_ids < 0] = 0
-        labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-
-        acc = mean(1. if pred == label else 0. for pred, label in zip(predictions, labels))
-        return {'accuracy': acc}
-
-    Trainer(
+    model = T5ForConditionalGeneration.from_pretrained(model_name).cuda()
+    callback = TrainerCallbackForEval()
+    trainer = Trainer(
         tokenizer=tokenizer,
         model=model,
         args=args,
         train_dataset=train_data,
         eval_dataset=test_data,
         data_collator=DataCollatorForSeq2Seq(tokenizer, model),
-        compute_metrics=_compute_metrics
-    ).train()
+        callbacks=[callback]
+    )
+
+    trainer.train()
 
 
 if __name__ == '__main__':
